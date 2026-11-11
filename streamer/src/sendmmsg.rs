@@ -5,10 +5,13 @@ use {
     crate::msghdr::create_msghdr,
     itertools::izip,
     libc::{iovec, mmsghdr, sockaddr_in, sockaddr_in6, sockaddr_storage, socklen_t},
+    nix::sys::socket::{ControlMessage, MsgFlags, SockaddrStorage, sendmsg},
     std::{
+        io::IoSlice,
         mem::{self, MaybeUninit},
         os::unix::io::AsRawFd,
         ptr,
+        sync::atomic::Ordering,
     },
 };
 use {
@@ -17,6 +20,7 @@ use {
         borrow::Borrow,
         io,
         net::{SocketAddr, UdpSocket},
+        sync::atomic::AtomicBool,
     },
     thiserror::Error,
 };
@@ -252,6 +256,130 @@ where
     Ok(num_sent)
 }
 
+/// Most segments one UDP GSO send may carry. The kernel's `UDP_MAX_SEGMENTS`
+/// is 64 on older kernels and 128 on newer ones.
+#[cfg(target_os = "linux")]
+const MAX_GSO_SEGMENTS: usize = 64;
+
+/// Most payload bytes one UDP GSO send may carry. The segments travel through
+/// the stack as a single IPv4 packet, with its IP and UDP headers.
+#[cfg(target_os = "linux")]
+const MAX_GSO_PAYLOAD: usize = u16::MAX as usize - 20 - 8;
+
+/// Sends `packets` to `dest` with one `sendmsg`. More than one packet goes out
+/// as the segments of a UDP GSO send, so they must all have the same length.
+#[cfg(target_os = "linux")]
+fn send_segments<T: AsRef<[u8]>>(
+    sock: &UdpSocket,
+    packets: &[T],
+    dest: &SocketAddr,
+) -> io::Result<()> {
+    debug_assert!((1..=MAX_GSO_SEGMENTS).contains(&packets.len()));
+    let mut iov = [IoSlice::new(&[]); MAX_GSO_SEGMENTS];
+    for (iov, packet) in iov.iter_mut().zip(packets) {
+        *iov = IoSlice::new(packet.as_ref());
+    }
+    let segment_size = packets[0].as_ref().len() as u16;
+    let gso = [ControlMessage::UdpGsoSegments(&segment_size)];
+    sendmsg(
+        sock.as_raw_fd(),
+        &iov[..packets.len()],
+        if packets.len() > 1 { &gso } else { &[] },
+        MsgFlags::empty(),
+        Some(&SockaddrStorage::from(*dest)),
+    )?;
+    Ok(())
+}
+
+/// Send every packet in `packets` to the single destination `dest`.
+///
+/// Each run of consecutive packets of equal length goes to the kernel as one
+/// UDP GSO send (`UDP_SEGMENT`). The run makes a single trip through the
+/// network stack and is cut into datagrams where it leaves the host, so the
+/// receiver sees the same datagrams in the same order as with [`batch_send`],
+/// at a fraction of the cost per packet. A packet whose neighbours differ in
+/// length costs a `sendmsg` of its own, so this is meant for batches made of
+/// such runs. A run that the local egress queue drops is lost whole.
+///
+/// A run the kernel refuses to send this way is sent again with
+/// [`batch_send`], so nothing is lost that plain datagrams would deliver.
+/// `gso` starts out `true`. It is cleared when the refusal says that the
+/// kernel or the route to `dest` does not take GSO, for example an output
+/// device without checksum offload, and from then on everything is sent with
+/// [`batch_send`]. Keep one flag per socket and destination.
+///
+/// The segments differ from plain datagrams in one way on the wire: unless
+/// `sock` sets `IP_MTU_DISCOVER` to `IP_PMTUDISC_DO` or `IP_PMTUDISC_PROBE`,
+/// the segments of a send larger than the route MTU leave without the
+/// don't-fragment bit.
+///
+/// Shares the semantics of [`batch_send`]: packets that cannot be sent only
+/// lower the returned count, an error means the socket is permanently
+/// unusable.
+#[cfg(target_os = "linux")]
+pub fn batch_send_to<'a, T: 'a + ?Sized>(
+    sock: &UdpSocket,
+    packets: &[&'a T],
+    dest: &SocketAddr,
+    gso: &AtomicBool,
+) -> Result</*num_sent:*/ usize, SendPktsError>
+where
+    &'a T: AsRef<[u8]>,
+{
+    let mut num_sent = 0;
+    let mut packets = packets;
+    while gso.load(Ordering::Relaxed) {
+        let Some(first) = packets.first() else {
+            return Ok(num_sent);
+        };
+        let len = first.as_ref().len();
+        let max_segments = MAX_GSO_PAYLOAD
+            .checked_div(len)
+            .map_or(1, |max| max.clamp(1, MAX_GSO_SEGMENTS));
+        let run_len = packets
+            .iter()
+            .take(max_segments)
+            .take_while(|packet| packet.as_ref().len() == len)
+            .count();
+        let (run, rest) = packets.split_at(run_len);
+        match send_segments(sock, run, dest) {
+            Ok(()) => num_sent += run.len(),
+            Err(err) if run.len() > 1 => {
+                // The kernel checks a GSO send before it transmits, so the
+                // run goes out again as plain datagrams. Those also get past
+                // what stops only the GSO send, such as a path MTU below the
+                // segment size, which the kernel answers by fragmenting them.
+                if matches!(err.raw_os_error(), Some(libc::EIO | libc::EINVAL))
+                    && gso.swap(false, Ordering::Relaxed)
+                {
+                    // The kernel or the route to `dest` does not take GSO.
+                    info!("UDP GSO to {dest} refused ({err}), sending plain datagrams instead");
+                }
+                num_sent += batch_send(sock, run.iter().map(|packet| (*packet, dest)))?;
+            }
+            Err(err) => check_fatal(err)?,
+        }
+        packets = rest;
+    }
+    let packets = packets.iter().map(|packet| (*packet, dest));
+    Ok(num_sent + batch_send(sock, packets)?)
+}
+
+/// See the linux implementation of [`batch_send_to`].
+// The lifetime constraints and the unused flag match 'linux' code.
+#[cfg(not(target_os = "linux"))]
+pub fn batch_send_to<'a, T: 'a + ?Sized>(
+    sock: &UdpSocket,
+    packets: &[&'a T],
+    dest: &SocketAddr,
+    _gso: &AtomicBool,
+) -> Result</*num_sent:*/ usize, SendPktsError>
+where
+    &'a T: AsRef<[u8]>,
+{
+    batch_send(sock, packets.iter().map(|packet| (*packet, dest)))
+}
+
 /// Send the same `packet` to every destination in `dests`.
 ///
 /// Shares the semantics of [`batch_send`]: unreachable destinations only lower
@@ -273,18 +401,21 @@ where
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use {crate::sendmmsg::SendPktsError, std::net::UdpSocket};
+    use crate::sendmmsg::SendPktsError;
     use {
         crate::{
             packet::BytesPacketBatch,
             recvmmsg::{PacketBufferPool, recv_mmsg},
-            sendmmsg::{batch_send, multi_target_send},
+            sendmmsg::{batch_send, batch_send_to, multi_target_send},
         },
         solana_net_utils::sockets::bind_to_localhost_unique,
         solana_packet::PACKET_DATA_SIZE,
         std::{
             assert_matches,
-            net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+            iter::repeat_n,
+            net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+            sync::atomic::AtomicBool,
+            time::Duration,
         },
     };
 
@@ -522,6 +653,221 @@ mod tests {
         let packet_refs: Vec<_> = packets.iter().map(|p| (&p[..], &addr)).collect();
 
         match batch_send(&not_a_socket, packet_refs) {
+            Ok(num_sent) => panic!("a send on a non-socket fd must fail, sent {num_sent}"),
+            Err(SendPktsError::IoError(ioerror)) => {
+                assert_eq!(ioerror.raw_os_error(), Some(libc::ENOTSOCK));
+            }
+        }
+    }
+
+    /// Packets with distinct fill bytes, so a test sees datagram boundaries
+    /// and order, not only counts.
+    fn numbered_packets(lens: impl IntoIterator<Item = usize>) -> Vec<Vec<u8>> {
+        lens.into_iter()
+            .enumerate()
+            .map(|(i, len)| vec![i as u8; len])
+            .collect()
+    }
+
+    /// Sends `packets` to a fresh localhost reader with [`batch_send_to`].
+    /// Returns the count it reports and what the reader gets, in order: the
+    /// datagrams, or with `gro` (Linux) the sends themselves, because a
+    /// reader that takes UDP GRO is handed every GSO send whole.
+    fn send_to_reader(
+        sender: &UdpSocket,
+        packets: &[Vec<u8>],
+        gso: &AtomicBool,
+        gro: bool,
+    ) -> (usize, Vec<Vec<u8>>) {
+        let reader = bind_to_localhost_unique().expect("should bind - reader");
+        reader
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        #[cfg(target_os = "linux")]
+        if gro {
+            use std::os::fd::AsRawFd;
+            let on: libc::c_int = 1;
+            // SAFETY: `reader` is an open socket and `on` outlives the call.
+            let rc = unsafe {
+                libc::setsockopt(
+                    reader.as_raw_fd(),
+                    libc::SOL_UDP,
+                    libc::UDP_GRO,
+                    (&raw const on).cast(),
+                    size_of_val(&on) as libc::socklen_t,
+                )
+            };
+            assert_eq!(rc, 0);
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert!(!gro);
+        let addr = reader.local_addr().unwrap();
+        let packet_refs: Vec<_> = packets.iter().map(|p| &p[..]).collect();
+        let num_sent =
+            batch_send_to(sender, &packet_refs, &addr, gso).expect("socket should be usable");
+        let mut buf = vec![0u8; 65_536];
+        let mut received = Vec::new();
+        while let Ok(len) = reader.recv(&mut buf) {
+            received.push(buf[..len].to_vec());
+        }
+        (num_sent, received)
+    }
+
+    #[test]
+    fn test_batch_send_to_delivers_runs_in_order() {
+        // The shape of a broadcast batch: a run of data shreds, then a run of
+        // coding shreds.
+        let packets = numbered_packets(repeat_n(1203, 12).chain(repeat_n(1228, 12)));
+        let sender = bind_to_localhost_unique().expect("should bind - sender");
+        let gso = AtomicBool::new(true);
+
+        let (num_sent, received) = send_to_reader(&sender, &packets, &gso, false);
+
+        assert_eq!(num_sent, packets.len());
+        assert_eq!(received, packets);
+        #[cfg(target_os = "linux")]
+        assert!(gso.into_inner(), "loopback takes UDP GSO");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_batch_send_to_sends_each_run_as_one_gso_send() {
+        let packets = numbered_packets(repeat_n(1203, 12).chain(repeat_n(1228, 12)));
+        let sender = bind_to_localhost_unique().expect("should bind - sender");
+        let gso = AtomicBool::new(true);
+
+        let (num_sent, sends) = send_to_reader(&sender, &packets, &gso, true);
+
+        assert_eq!(num_sent, packets.len());
+        assert_eq!(sends, [packets[..12].concat(), packets[12..].concat()]);
+        assert!(gso.into_inner());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_batch_send_to_splits_a_run_at_the_segment_limit() {
+        // More equal-length packets than one GSO send may carry.
+        let packets = numbered_packets(repeat_n(100, 150));
+        let sender = bind_to_localhost_unique().expect("should bind - sender");
+        let gso = AtomicBool::new(true);
+
+        let (num_sent, sends) = send_to_reader(&sender, &packets, &gso, true);
+
+        assert_eq!(num_sent, packets.len());
+        assert_eq!(
+            sends,
+            [
+                packets[..64].concat(),
+                packets[64..128].concat(),
+                packets[128..].concat()
+            ]
+        );
+        assert!(gso.into_inner());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_batch_send_to_splits_a_run_at_the_datagram_size_limit() {
+        // More bytes than one GSO send may carry: 53 packets of this size
+        // fit under the largest UDP payload, 54 do not.
+        let packets = numbered_packets(repeat_n(PACKET_DATA_SIZE, 60));
+        let sender = bind_to_localhost_unique().expect("should bind - sender");
+        let gso = AtomicBool::new(true);
+
+        let (num_sent, sends) = send_to_reader(&sender, &packets, &gso, true);
+
+        assert_eq!(num_sent, packets.len());
+        assert_eq!(sends, [packets[..53].concat(), packets[53..].concat()]);
+        assert!(gso.into_inner());
+    }
+
+    #[test]
+    fn test_batch_send_to_mixed_and_empty_packets() {
+        let packets = numbered_packets([100, 200, 100, 100, 0, 0, 300, 300, 300, 7]);
+        let sender = bind_to_localhost_unique().expect("should bind - sender");
+
+        let (num_sent, received) = send_to_reader(&sender, &packets, &AtomicBool::new(true), false);
+
+        assert_eq!(num_sent, packets.len());
+        assert_eq!(received, packets);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_batch_send_to_falls_back_when_gso_is_refused() {
+        use std::{os::fd::AsRawFd, sync::atomic::Ordering};
+
+        let packets = numbered_packets(repeat_n(1203, 12).chain(repeat_n(1228, 12)));
+        let sender = bind_to_localhost_unique().expect("should bind - sender");
+        // The kernel refuses UDP GSO on a socket that sends without checksums.
+        let on: libc::c_int = 1;
+        // SAFETY: `sender` is an open socket and `on` outlives the call.
+        let rc = unsafe {
+            libc::setsockopt(
+                sender.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NO_CHECK,
+                (&raw const on).cast(),
+                size_of_val(&on) as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0);
+        let gso = AtomicBool::new(true);
+
+        let (num_sent, received) = send_to_reader(&sender, &packets, &gso, false);
+
+        assert_eq!(num_sent, packets.len());
+        assert_eq!(received, packets);
+        assert!(
+            !gso.load(Ordering::Relaxed),
+            "a refused GSO send must not be tried again"
+        );
+
+        // Later batches skip GSO and still arrive.
+        let (num_sent, received) = send_to_reader(&sender, &packets, &gso, false);
+        assert_eq!(num_sent, packets.len());
+        assert_eq!(received, packets);
+    }
+
+    #[test]
+    fn test_batch_send_to_unreachable_destination() {
+        let packets = numbered_packets(repeat_n(PACKET_DATA_SIZE, 3));
+        let packet_refs: Vec<_> = packets.iter().map(|p| &p[..]).collect();
+        let ipv4broadcast = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 8080);
+        let sender = bind_to_localhost_unique().expect("should bind - sender");
+        let gso = AtomicBool::new(true);
+
+        assert_matches!(
+            batch_send_to(&sender, &packet_refs, &ipv4broadcast, &gso),
+            Ok(/*num_sent:*/ 0),
+            "an unreachable destination must not be fatal"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            gso.into_inner(),
+            "an unreachable destination says nothing about GSO support"
+        );
+    }
+
+    /// Like [`test_fatal_error_not_a_socket`], for the single-destination send.
+    #[test]
+    #[cfg(unix)]
+    fn test_batch_send_to_fatal_error_not_a_socket() {
+        use std::{
+            fs::File,
+            os::fd::{FromRawFd, IntoRawFd},
+        };
+
+        let devnull = File::open("/dev/null").expect("should open /dev/null");
+        // SAFETY: `into_raw_fd` transfers ownership of a valid, open fd, so the
+        // resulting `UdpSocket` is the sole owner and closes it exactly once.
+        let not_a_socket = unsafe { UdpSocket::from_raw_fd(devnull.into_raw_fd()) };
+
+        let packets = numbered_packets(repeat_n(PACKET_DATA_SIZE, 3));
+        let packet_refs: Vec<_> = packets.iter().map(|p| &p[..]).collect();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+
+        match batch_send_to(&not_a_socket, &packet_refs, &addr, &AtomicBool::new(true)) {
             Ok(num_sent) => panic!("a send on a non-socket fd must fail, sent {num_sent}"),
             Err(SendPktsError::IoError(ioerror)) => {
                 assert_eq!(ioerror.raw_os_error(), Some(libc::ENOTSOCK));
